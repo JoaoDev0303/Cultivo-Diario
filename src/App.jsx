@@ -12,6 +12,10 @@ import {
   Heart,
   Copy,
   Check,
+  LogIn,
+  LogOut,
+  ShieldCheck,
+  X,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -25,7 +29,7 @@ import {
 import { supabase, getUserId } from "./supabaseClient";
 
 // ---- troque pela sua chave Pix real (ou apague o bloco de doação) ----
-const PIX_KEY = "041.482.495-43";
+const PIX_KEY = "seu-email-ou-chave-pix@exemplo.com";
 const BUY_ME_A_COFFEE_URL = ""; // ex: "https://buymeacoffee.com/seuusuario"
 
 function todayKey(offset = 0) {
@@ -53,7 +57,11 @@ const TABS = [
 ];
 
 export default function App() {
-  const userId = useMemo(() => getUserId(), []);
+  const anonUserId = useMemo(() => getUserId(), []);
+  const [session, setSession] = useState(null);
+  const userId = session?.user?.id || anonUserId;
+  const isLoggedIn = !!session?.user;
+
   const [habits, setHabits] = useState([]);
   const [checkinsByHabit, setCheckinsByHabit] = useState({}); // { habitId: Set(dateStr) }
   const [profile, setProfile] = useState({
@@ -74,6 +82,15 @@ export default function App() {
   );
   const [pixCopied, setPixCopied] = useState(false);
   const reminderTimeoutRef = useRef(null);
+
+  // ---- auth panel state ----
+  const [showAuthPanel, setShowAuthPanel] = useState(false);
+  const [authMode, setAuthMode] = useState("signup"); // 'signup' | 'login'
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState(null);
+  const [authNotice, setAuthNotice] = useState(null);
 
   const today = todayKey(0);
   const last14 = useMemo(() => {
@@ -97,6 +114,56 @@ export default function App() {
       offset -= 1;
     }
     return streak;
+  }
+
+  // ---- sessão do Supabase Auth ----
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      async (event, newSession) => {
+        setSession(newSession);
+        if (event === "SIGNED_IN" && newSession?.user?.id) {
+          await claimAnonymousData(newSession.user.id);
+          setShowAuthPanel(false);
+          setAuthNotice(null);
+        }
+      }
+    );
+    return () => listener.subscription.unsubscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // migra hábitos/checkins/perfil do id anônimo do navegador pra conta logada
+  async function claimAnonymousData(newUserId) {
+    if (!anonUserId || newUserId === anonUserId) return;
+    try {
+      await supabase
+        .from("habits")
+        .update({ user_id: newUserId })
+        .eq("user_id", anonUserId);
+      await supabase
+        .from("checkins")
+        .update({ user_id: newUserId })
+        .eq("user_id", anonUserId);
+
+      const { data: existingNewProfile } = await supabase
+        .from("profiles")
+        .select("user_id")
+        .eq("user_id", newUserId)
+        .maybeSingle();
+
+      if (existingNewProfile) {
+        // já tem perfil na conta (login em outro aparelho) — descarta o anônimo
+        await supabase.from("profiles").delete().eq("user_id", anonUserId);
+      } else {
+        await supabase
+          .from("profiles")
+          .update({ user_id: newUserId })
+          .eq("user_id", anonUserId);
+      }
+    } catch (e) {
+      console.error("Falha ao migrar dados anônimos:", e);
+    }
   }
 
   // ---- carregar tudo do Supabase ----
@@ -124,6 +191,14 @@ export default function App() {
       if (profileData) {
         setProfile(profileData);
         setNicknameDraft(profileData.nickname || "");
+      } else {
+        setProfile({
+          nickname: "",
+          streak: 0,
+          reminder_time: "20:00",
+          notify_enabled: false,
+        });
+        setNicknameDraft("");
       }
     } catch (e) {
       console.error(e);
@@ -138,7 +213,65 @@ export default function App() {
   useEffect(() => {
     loadAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [userId]);
+
+  // ---- autenticação ----
+  async function handleAuthSubmit(e) {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthNotice(null);
+    if (!authEmail || !authPassword) return;
+    setAuthLoading(true);
+    try {
+      if (authMode === "signup") {
+        const { data, error: err } = await supabase.auth.signUp({
+          email: authEmail,
+          password: authPassword,
+        });
+        if (err) throw err;
+        if (data.session) {
+          // confirmação de e-mail desativada — já entrou direto
+        } else {
+          setAuthNotice(
+            "Conta criada! Verifique seu e-mail e clique no link de confirmação para entrar."
+          );
+        }
+      } else {
+        const { error: err } = await supabase.auth.signInWithPassword({
+          email: authEmail,
+          password: authPassword,
+        });
+        if (err) throw err;
+      }
+    } catch (e) {
+      setAuthError(traduzErroAuth(e.message));
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  function traduzErroAuth(msg) {
+    if (!msg) return "Algo deu errado. Tente de novo.";
+    if (msg.includes("already registered") || msg.includes("already exists"))
+      return "Esse e-mail já tem conta. Tente entrar em vez de criar.";
+    if (msg.includes("Invalid login credentials"))
+      return "E-mail ou senha incorretos.";
+    if (msg.includes("Password should be"))
+      return "A senha precisa ter pelo menos 6 caracteres.";
+    if (msg.includes("Unable to validate email"))
+      return "E-mail inválido.";
+    return msg;
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setProfile({
+      nickname: "",
+      streak: 0,
+      reminder_time: "20:00",
+      notify_enabled: false,
+    });
+  }
 
   // ---- hábitos ----
   async function addHabit(e) {
@@ -314,10 +447,31 @@ export default function App() {
         .hs-root * { box-sizing: border-box; }
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Work+Sans:wght@400;500;600&display=swap');
         .hs-shell { max-width: 640px; margin: 0 auto; }
-        .hs-header { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 18px; flex-wrap: wrap; gap: 12px; }
+        .hs-header { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 12px; }
         .hs-title { font-family: 'Fraunces', serif; font-weight: 700; font-size: 30px; letter-spacing: -0.01em; margin: 0; color: #F2EFE4; }
         .hs-subtitle { color: #9AA89C; font-size: 13.5px; margin-top: 4px; text-transform: capitalize; }
+        .hs-header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
         .hs-streak-badge { display: flex; align-items: center; gap: 6px; background: rgba(232, 184, 75, 0.12); border: 1px solid rgba(232, 184, 75, 0.35); color: #E8B84B; padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+        .hs-auth-btn { display: flex; align-items: center; gap: 6px; background: #1C2A20; border: 1px solid #2C3D31; color: #D9E0D6; padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; transition: background 0.15s ease; }
+        .hs-auth-btn:hover { background: #24362B; }
+        .hs-account-chip { display: flex; align-items: center; gap: 8px; background: rgba(111,168,117,0.12); border: 1px solid rgba(111,168,117,0.35); color: #9FCBA4; padding: 7px 12px; border-radius: 999px; font-size: 12.5px; font-weight: 600; }
+        .hs-account-chip button { background: none; border: none; color: #9FCBA4; cursor: pointer; display: flex; padding: 0; }
+        .hs-account-email { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .hs-guest-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: rgba(232, 184, 75, 0.1); border: 1px solid rgba(232, 184, 75, 0.3); color: #D9CBA0; padding: 12px 14px; border-radius: 12px; font-size: 13px; margin-bottom: 18px; flex-wrap: wrap; }
+        .hs-guest-banner-btn { background: #E8B84B; color: #10190F; border: none; border-radius: 8px; padding: 7px 14px; font-size: 12.5px; font-weight: 700; cursor: pointer; font-family: inherit; white-space: nowrap; }
+        .hs-auth-overlay { position: fixed; inset: 0; background: rgba(8,12,9,0.7); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+        .hs-auth-panel { background: #1C2A20; border: 1px solid #2C3D31; border-radius: 16px; padding: 22px; max-width: 380px; width: 100%; position: relative; }
+        .hs-auth-close { position: absolute; top: 14px; right: 14px; background: none; border: none; color: #7C8C7F; cursor: pointer; display: flex; }
+        .hs-auth-title { font-family: 'Fraunces', serif; font-size: 20px; font-weight: 600; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
+        .hs-auth-sub { color: #7C8C7F; font-size: 12.5px; margin-bottom: 18px; line-height: 1.5; }
+        .hs-auth-tabs { display: flex; gap: 6px; margin-bottom: 16px; background: #182219; border: 1px solid #2C3D31; border-radius: 10px; padding: 4px; }
+        .hs-auth-tab { flex: 1; padding: 8px; border-radius: 7px; border: none; cursor: pointer; background: transparent; color: #7C8C7F; font-size: 12.5px; font-weight: 600; font-family: inherit; }
+        .hs-auth-tab.active { background: #2C3D31; color: #F2EFE4; }
+        .hs-auth-form { display: flex; flex-direction: column; gap: 10px; }
+        .hs-auth-submit { background: #6FA875; color: #10190F; border: none; border-radius: 10px; padding: 11px; font-weight: 700; font-size: 14px; cursor: pointer; font-family: inherit; margin-top: 4px; }
+        .hs-auth-submit:disabled { opacity: 0.6; cursor: default; }
+        .hs-auth-error { color: #E7A99B; font-size: 12.5px; margin-top: 2px; }
+        .hs-auth-notice { color: #9FCBA4; font-size: 12.5px; margin-top: 2px; line-height: 1.5; }
         .hs-tabs { display: flex; gap: 6px; margin-bottom: 20px; background: #182219; border: 1px solid #2C3D31; border-radius: 12px; padding: 4px; }
         .hs-tab { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px 8px; border-radius: 9px; border: none; cursor: pointer; background: transparent; color: #7C8C7F; font-size: 13px; font-weight: 600; transition: all 0.15s ease; font-family: inherit; }
         .hs-tab.active { background: #2C3D31; color: #F2EFE4; }
@@ -325,7 +479,7 @@ export default function App() {
         .hs-risk-banner b { color: #F0BEB2; }
         .hs-error-banner { background: rgba(201, 122, 107, 0.14); border: 1px solid rgba(201, 122, 107, 0.4); color: #E7A99B; padding: 12px 14px; border-radius: 12px; font-size: 13px; margin-bottom: 18px; }
         .hs-add-form { display: flex; gap: 8px; margin-bottom: 24px; }
-        .hs-input { flex: 1; background: #1E2D22; border: 1px solid #33453A; color: #F2EFE4; padding: 12px 14px; border-radius: 10px; font-size: 14.5px; font-family: inherit; outline: none; transition: border-color 0.15s ease; }
+        .hs-input { flex: 1; background: #1E2D22; border: 1px solid #33453A; color: #F2EFE4; padding: 12px 14px; border-radius: 10px; font-size: 14.5px; font-family: inherit; outline: none; transition: border-color 0.15s ease; width: 100%; }
         .hs-input:focus { border-color: #6FA875; }
         .hs-input::placeholder { color: #6B7A6E; }
         .hs-add-btn { background: #6FA875; color: #10190F; border: none; border-radius: 10px; padding: 0 18px; display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 14px; cursor: pointer; transition: background 0.15s ease, transform 0.1s ease; }
@@ -394,13 +548,47 @@ export default function App() {
               })}
             </div>
           </div>
-          {habits.length > 0 && (
-            <div className="hs-streak-badge">
-              <Flame size={15} />
-              {totalStreak} {totalStreak === 1 ? "dia seguido" : "dias seguidos"}
-            </div>
-          )}
+          <div className="hs-header-right">
+            {habits.length > 0 && (
+              <div className="hs-streak-badge">
+                <Flame size={15} />
+                {totalStreak} {totalStreak === 1 ? "dia seguido" : "dias seguidos"}
+              </div>
+            )}
+            {isLoggedIn ? (
+              <div className="hs-account-chip">
+                <ShieldCheck size={14} />
+                <span className="hs-account-email">{session.user.email}</span>
+                <button onClick={handleLogout} aria-label="Sair da conta" title="Sair">
+                  <LogOut size={14} />
+                </button>
+              </div>
+            ) : (
+              <button className="hs-auth-btn" onClick={() => setShowAuthPanel(true)}>
+                <LogIn size={14} />
+                Entrar
+              </button>
+            )}
+          </div>
         </div>
+
+        {!isLoggedIn && (
+          <div className="hs-guest-banner">
+            <span>
+              🔒 Você está usando sem conta — seus dados ficam só neste navegador.
+              Crie uma conta pra acessar de qualquer aparelho.
+            </span>
+            <button
+              className="hs-guest-banner-btn"
+              onClick={() => {
+                setAuthMode("signup");
+                setShowAuthPanel(true);
+              }}
+            >
+              Criar conta
+            </button>
+          </div>
+        )}
 
         {error && <div className="hs-error-banner">{error}</div>}
 
@@ -673,6 +861,82 @@ export default function App() {
 
         <div className="hs-footer-note">feito com 🌱 — cultivodiario</div>
       </div>
+
+      {showAuthPanel && (
+        <div
+          className="hs-auth-overlay"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowAuthPanel(false);
+          }}
+        >
+          <div className="hs-auth-panel">
+            <button
+              className="hs-auth-close"
+              onClick={() => setShowAuthPanel(false)}
+              aria-label="Fechar"
+            >
+              <X size={18} />
+            </button>
+            <h3 className="hs-auth-title">
+              <ShieldCheck size={18} />
+              {authMode === "signup" ? "Criar conta" : "Entrar"}
+            </h3>
+            <div className="hs-auth-sub">
+              {authMode === "signup"
+                ? "Seus hábitos e sequência atuais serão levados pra essa conta automaticamente."
+                : "Entre para acessar seus hábitos de qualquer aparelho."}
+            </div>
+            <div className="hs-auth-tabs">
+              <button
+                className={"hs-auth-tab" + (authMode === "signup" ? " active" : "")}
+                onClick={() => {
+                  setAuthMode("signup");
+                  setAuthError(null);
+                }}
+              >
+                Criar conta
+              </button>
+              <button
+                className={"hs-auth-tab" + (authMode === "login" ? " active" : "")}
+                onClick={() => {
+                  setAuthMode("login");
+                  setAuthError(null);
+                }}
+              >
+                Entrar
+              </button>
+            </div>
+            <form className="hs-auth-form" onSubmit={handleAuthSubmit}>
+              <input
+                className="hs-input"
+                type="email"
+                placeholder="seu@email.com"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                required
+              />
+              <input
+                className="hs-input"
+                type="password"
+                placeholder="Senha (mín. 6 caracteres)"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                minLength={6}
+                required
+              />
+              <button className="hs-auth-submit" type="submit" disabled={authLoading}>
+                {authLoading
+                  ? "Aguarde…"
+                  : authMode === "signup"
+                  ? "Criar conta"
+                  : "Entrar"}
+              </button>
+              {authError && <div className="hs-auth-error">{authError}</div>}
+              {authNotice && <div className="hs-auth-notice">{authNotice}</div>}
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
