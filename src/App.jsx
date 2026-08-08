@@ -29,7 +29,7 @@ import {
 import { supabase, getUserId } from "./supabaseClient";
 
 // ---- troque pela sua chave Pix real (ou apague o bloco de doação) ----
-const PIX_KEY = "seu-email-ou-chave-pix@exemplo.com";
+const PIX_KEY = "joaodev03@gmail.com";
 const BUY_ME_A_COFFEE_URL = ""; // ex: "https://buymeacoffee.com/seuusuario"
 
 function todayKey(offset = 0) {
